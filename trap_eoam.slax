@@ -1,0 +1,234 @@
+/*
+ * Filename      : trap_eoam.slax
+ * Author        : Christian Giese cgiese@juniper.net
+ * Build         : R1.9
+ * Platform      : MX TRIO
+ * Release       : Junos 12.2+
+ * SVN INFO      :
+ *
+ * $Revision: 36708 $
+ * $Date: 2014-06-17 13:36:11 +0200 (Tue, 17 Jun 2014) $
+ * $Author: cgiese $
+ *
+ * Description   : generates SNMP traps based on OAM CFM defect syslog
+ *
+ */
+
+/* Junos Space specific context, name and description */
+/* @CONTEXT = "/hide" */
+/* @NAME = "R1.9 - trap_eoam" */
+/* @DESCRIPTION = "generates SNMP traps based on OAM CFM defect syslog" */
+
+version 1.1;
+
+ns junos = "http://xml.juniper.net/junos/*/junos";
+ns xnm = "http://xml.juniper.net/xnm/1.1/xnm";
+ns jcs = "http://xml.juniper.net/junos/commit-scripts/1.0";
+ns str = "http://exslt.org/strings";
+
+import "../import/junos.xsl";
+
+/* This is an event script */
+
+var $event-definition = {
+    <event-options> {
+        <policy> {
+            <name> "EOAM_CFM_STATUS";
+            <events> "CFMD_CCM_DEFECT_RMEP";
+            <events> "CFMD_CCM_DEFECT_RDI";
+            <events> "CFMD_CCM_DEFECT_NONE";
+            <then> {
+                <event-script> {
+                    <name> "trap_eoam.slax";
+                    <arguments> {
+                        <name> "event";
+                        <value> "STATUS";
+                    }
+                }
+            }
+        } /* ... policy EOAM_CFM_STATUS" */
+        <policy> {
+            <name> "EOAM_INTERVAL";
+            <events> "OAM-TRAP";
+            <then> {
+                <event-script> {
+                    <name> "trap_eoam.slax";
+                    <arguments> {
+                        <name> "event";
+                        <value> "INTERVAL";
+                    }
+                }
+            }
+        } /* ... policy EOAM_INTERVA" */
+    }
+}
+
+param $event;
+
+match / {
+    <event-script-results> {   	
+        /* open connection */
+        var $connection = jcs:open();
+
+        /* if triggered by EOAM_INTERVAL ... */
+        if ( $event == "INTERVAL" ) {
+        	
+            /* get oam informations ...
+             *    show oam ethernet connectivity-fault-management interfaces extensive
+             */
+            var $getOamInfoAll = <get-cfm-interfaces-information> {
+                <extensive>;
+            }
+            var $oamInfoAll = jcs:execute ( $connection, $getOamInfoAll );
+
+            for-each ( $oamInfoAll//cfm-entry ) {
+
+                var $ifl = str:replace( .//cfm-interface-name, " ", "");
+                var $ma = .//cfm-maintenance-association-name;
+                var $md = .//cfm-maintenance-domain-name;
+                var $level = .//cfm-interface-session-identifier/cfm-level;
+
+                /* read service ifl infos from file provided by commit-script ...
+                 *     e.g. /mfs/var/tmp/info-ge-0_0_0.1000
+                 */
+                var $iflFilePath = "/mfs/var/tmp/info-" _ str:replace( $ifl, "/", "_" );
+                var $iflFile = document( $iflFilePath );
+
+                if ( $iflFile//line-id ) {
+                    var $lineId = $iflFile//line-id;
+                    var $vlan = $iflFile//anp-tag;
+                    var $serviceVlan = $iflFile//service-vlan;
+                    var $oamFilePath = "/mfs/var/tmp/oam-" _ $ma;
+                    mvar $status = "NONE";
+
+                    /* get latest cfm state ... */
+                    var $getOamInfo = <get-cfm-mep-database> {
+                        <maintenance-domain> $md;
+                        <maintenance-association> $ma;
+                    }
+                    var $oamInfo = jcs:execute ( $connection, $getOamInfo );
+
+                    if ( $oamInfo//cfm-defect-remote-mep-no-ccm == "yes" ) {
+                        set $status = "TIMEOUT";
+                    } else {
+                        if ( $oamInfo//cfm-defect-rdi-in-some-mep == "yes" ) {
+                            set $status = "RDI";
+                        }
+                    }
+
+                    /* read oam status file ... e.g. /mfs/var/tmp/oam-ge-0_0_0.1000 ... */
+                    var $oamFile = document( $oamFilePath );
+
+                    if ( not( $status == $oamFile//status ) || not( $ifl == $oamFile//interface ) ) {
+
+                        /* update oam status file ... */
+                        var $oamFileNew = <oam-status> {
+                            <status> $status;
+                            <timestamp> $localtime;
+                            <interface> $ifl;
+                            <line-id> $lineId;
+                            <service-vlan> $serviceVlan;
+                            <anp-tag> $vlan;
+                            <ma> $ma;
+                            <md> $md;
+                            <level> $level;
+                        }
+                        <xsl:document method="xml" href=$oamFilePath> {
+                            copy-of $oamFileNew;
+                        }
+
+                        call generateEventTrap( $connection, $status, $ifl, $lineId, $vlan, $serviceVlan, $level, $md, $ma  );
+                    }
+                }
+            }
+        } else {
+        	
+            /* get the syslog message */
+            var $message = event-script-input/trigger-event/message;
+
+            /* parse message string */
+            var $messageParts = jcs:split( "[[.space.]]", substring-after( $message, "Level: "  ) );
+            var $level = $messageParts[1];
+            var $md = $messageParts[3];
+            var $ma = $messageParts[5];
+            var $ifl = $messageParts[7];
+
+            /* read service ifl infos from file provided by commit-script ...
+             *     e.g. /mfs/var/tmp/info-ge-0_0_0.1000
+             */
+            var $iflFilePath = "/mfs/var/tmp/info-" _ str:replace( $ifl, "/", "_" );
+            var $iflFile = document( $iflFilePath );
+
+            if( $iflFile//line-id ) {
+
+                var $lineId = $iflFile//line-id;
+                var $vlan = $iflFile//anp-tag;
+                var $serviceVlan = $iflFile//service-vlan;
+                var $oamFilePath = "/mfs/var/tmp/oam-" _ $ma;
+                mvar $status = "NONE";
+
+                /* get latest cfm state ... */
+                var $getOamInfo = <get-cfm-mep-database> {
+                    <maintenance-domain> $md;
+                    <maintenance-association> $ma;
+                }
+                var $oamInfo = jcs:execute ( $connection, $getOamInfo );
+
+                if ( $oamInfo//cfm-defect-remote-mep-no-ccm == "yes" ) {
+                    set $status = "TIMEOUT";
+                } else {
+                    if ( $oamInfo//cfm-defect-rdi-in-some-mep == "yes" ) {
+                        set $status = "RDI";
+                    }
+                }
+
+                /* read oam status file ... e.g. /mfs/var/tmp/oam-ge-0_0_0.1000 ... */
+                var $oamFile = document( $oamFilePath );
+
+                if ( not( $status == $oamFile//status ) || not( $ifl == $oamFile//interface ) ) {
+
+                    /* update oam status file ... */
+                    var $oamFileNew = <oam-status> {
+                        <status> $status;
+                        <timestamp> $localtime;
+                        <interface> $ifl;
+                        <line-id> $lineId;
+                        <service-vlan> $serviceVlan;
+                        <anp-tag> $vlan;
+                        <ma> $ma;
+                        <md> $md;
+                        <level> $level;
+                    }
+                    <xsl:document method="xml" href=$oamFilePath> {
+                        copy-of $oamFileNew;
+                    }
+
+                    call generateEventTrap( $connection, $status, $ifl, $lineId, $vlan, $serviceVlan, $level, $md, $ma );
+                }
+            }
+        }
+        /* close connection */
+        var $closeResult = jcs:close ( $connection );
+    }
+}
+
+/* generate snmp trap */
+template generateEventTrap( $connection, $status, $ifl, $lineId, $vlan, $serviceVlan, $level, $md, $ma ) {
+    mvar $iflValue = $ifl;
+    if ( starts-with( $ifl, "xe-" ) ) {
+        set $iflValue = "\\" _ $iflValue;
+    }
+    var $requestSnmpTrap = <request-snmp-generate-trap> {
+        <trap> "jnxEventTrap";
+        <variable-bindings> "jnxEventTrapDescr[0]=Event-Trap, "
+                        _ "jnxEventAvAttribute[1]=event, jnxEventAvValue[1]=EOAM-CFM-ALARM-" _ $status _ ", "
+                        _ "jnxEventAvAttribute[2]=Line-Id, jnxEventAvValue[2]=" _ $lineId _", "
+                        _ "jnxEventAvAttribute[3]=ANP-Tag, jnxEventAvValue[3]=" _ $vlan _", "
+                        _ "jnxEventAvAttribute[4]=Service-Tag, jnxEventAvValue[4]=" _ $serviceVlan _", "
+                        _ "jnxEventAvAttribute[5]=ifDesc, jnxEventAvValue[5]=" _ $iflValue _", "
+                        _ "jnxEventAvAttribute[8]=Level, jnxEventAvValue[8]=" _ $level _", "
+                        _ "jnxEventAvAttribute[9]=MD, jnxEventAvValue[9]=" _ $md _", "
+                        _ "jnxEventAvAttribute[10]=MA, jnxEventAvValue[10]=" _ $ma;
+    }
+    var $snmpResult = jcs:execute ( $connection, $requestSnmpTrap );
+}
