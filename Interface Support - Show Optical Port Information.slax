@@ -1,0 +1,1373 @@
+/* 
+	show  diagnostics informations for given interface, output XML or HTML
+*/
+
+/*
+	Author: abartsch
+	Version: 1.4
+	Date: 21.02.2018
+	Last Modified By: avasilev
+	###Interface Support - Show Optical Port Information;v1.4;2018.02.21
+*/
+
+/*
+	Changelog:
+	----------
+	1.0; 04.10.2016 (abartsch)
+		- first version (with XML output only)
+	1.1; 05.10.2016 (abartsch)
+		- added HTML output
+	1.2; 19.12.2016 (abartsch)
+		- adapted to changed output of request-pfe-execute
+		07.02.2017 (abartsch)
+		- removed <output> tag in template rpc_failure
+	1.3; 25.08.2017 (avasilev)
+		- retrieving "Vendor Part Number" from <show-interfaces-optics-vendor-extension>
+	1.4; 21.02.2018 (avasilev, #77)
+		- added "format" as argument
+		- added insertExportWindowButton
+		- added termination if the specified interface is not available
+*/
+
+version 1.1;
+
+ns junos = "http://xml.juniper.net/junos/*/junos";
+ns xnm = "http://xml.juniper.net/xnm/1.1/xnm";
+ns jcs = "http://xml.juniper.net/junos/commit-scripts/1.0";
+/*ns slax = "http://xml.libslax.org/slax";*/
+ns exsl extension = "http://exslt.org/common";
+/* ns xutil extension = "http://xml.libslax.org/xutil"; */
+/* xutil:xml-to-string(); */
+ns ext = "http://xmlsoft.org/XSLT/namespace";
+
+ns bcersows = "http://bcersows@telekom.de";
+import "Space_Library-Local.slax";
+
+import "../import/junos.xsl";
+
+/* @CONTEXT = "/device[matches(name, "\w{3}J\d{2,3}") or matches(name, "bng|BNG.*$")]/interface-information/physical-interface[starts-with( name , "ge-" ) or starts-with( name , "xe-" )]" */
+/* @NAME = "Interface Support - Show Optical Port Information" */
+/* @DESCRIPTION = "Show optical diagnostics informations, output XML or HTML." */
+/* @ISLOCAL = "true" */
+/* @CATEGORY = "D02 Show" */
+/* @EXECUTIONTYPE = "SINGLEEXECUTION" */
+/* @PROMOTE = "no" */
+/* @xFAILJOBSTRING = "error" */
+/* @VARIABLECONTEXT = "[ {'name':'interface','defaultvalue':''},{'name':'format','selectionvalues':'html,xml'} ]" */
+
+var $arguments = {
+	<argument> {
+		<name> "CONTEXT";
+		<description> "Context of script execution";
+	}
+	<argument> {
+		<name> "format";
+		<description> "Optional. Output format: html OR xml. Default: html";
+	}
+}
+param $CONTEXT;
+param $interface;
+param $format;
+
+match / {
+	<op-script-results> {
+		mvar $localtime = date:date-time();
+		var $myDevice = jcs:regex( "/device\\[name=\"([^\"]*)\"\\].*", $CONTEXT )[2];
+
+		<output> {
+			var $Interface = {
+				if ( jcs:empty($interface) && jcs:regex( '/device\\[.*\\]/interface-information/physical-interface\\[name="[^"]*"\\]', $CONTEXT ) ) {
+					expr jcs:regex( '/device\\[.*\\]/interface-information/physical-interface\\[name="([^"]*)"\\]', $CONTEXT )[2];
+				}
+				else {
+					expr $interface;
+				}
+			}
+
+			if ( jcs:empty($Interface) ) {
+				call rpc_failure($message = "Parameter interface not specified, or script not called in the right context.");
+				<xsl:message terminate="yes"> ;
+			}
+
+			var $connection = jcs:open();
+			/* abort if no connection to local mgd */
+			if ($connection/..//xnm:error) {
+				call rpc_failure($rpc = $connection/.., $message = "Error connecting on mgd on this RE");
+				<xsl:message terminate="yes"> ;
+			}
+
+			/* pre-check */
+			/* TBD */
+
+			/* gather informations, part 0: status */
+
+			var $get-interface-information-rpc = <get-interface-information> {
+				<terse>;
+				<interface-name> $Interface;
+			}
+			var $results-0 = jcs:execute( $connection, $get-interface-information-rpc );
+			if ($results-0/..//xnm:error) {
+				call rpc_failure($rpc = $results-0/.., $message = "Error getting interface information");
+				<xsl:message terminate="yes"> ;
+			}
+
+			var $admin-status = $results-0/physical-interface/admin-status/text();
+			var $oper-status = $results-0/physical-interface/oper-status/text();
+
+			/* gather informations, part 1: level data (laser etc.) */
+
+			var $get-interface-optics-diagnostics-information-rpc = <get-interface-optics-diagnostics-information> {
+				<interface-name> $Interface;
+			}
+			var $results = jcs:execute($connection , $get-interface-optics-diagnostics-information-rpc);
+			if ($results/..//xnm:error) {
+				call rpc_failure($rpc = $results/.., $message = "Error collecting interface optics diagnostics information");
+				<xsl:message terminate="yes"> ;
+			}
+
+			/* If no physical interface information returned at all, then quit */
+
+			if ( ( jcs:empty( $results/physical-interface ) ) or ( $results/physical-interface/optics-diagnostics/optic-diagnostics-not-available = "N/A" ) ) {
+				uexpr "No information is available for interface: " _ $Interface _ ", because (probably) no module plugged in." _ "\n";
+				<xsl:message terminate="yes"> ;
+			}
+
+			var $vendor-extension-rpc = <show-interfaces-optics-vendor-extension> {
+				<interface-name> $Interface;
+			}
+			var $vendor-results = jcs:execute( $connection, $vendor-extension-rpc );
+			if ($vendor-results/..//xnm:error) {
+				call rpc_failure($rpc = $vendor-results/.., $message = "Error collecting vendor extension data");
+				<xsl:message terminate="yes"> ;
+			}
+
+			/* gather informations, part 2: vendor data etc. */
+
+			var $fpc = jcs:regex( "^.*-([0-9]+)/[0-9]+/[0-9]+$" , $Interface )[2];
+			var $pic = jcs:regex( "^.*-[0-9]+/([0-9]+)/[0-9]+$" , $Interface )[2];
+			var $xcvr = jcs:regex( "^.*-[0-9]+/[0-9]+/([0-9]+)$" , $Interface )[2];
+
+			/* get version */
+			var $version-rpc = <get-software-information> {
+				<brief>;
+			}
+
+			/* list of sfp and xfp */
+			var $req-pfe-execute-one-rpc = <request-pfe-execute> {
+				<target> "fpc" _ $fpc;
+				<command> "show sfp list";
+				<command> "show xfp list";
+			}
+
+			var $version = jcs:execute( $connection , $version-rpc );
+			if ($version/..//xnm:error) {
+				call rpc_failure($rpc = $version/.., $message = "Error collecting version information");
+				<xsl:message terminate="yes">;
+			}
+
+			var $results-one-0 = jcs:execute( $connection , $req-pfe-execute-one-rpc );
+			if ($results-one-0/..//xnm:error) {
+				call rpc_failure($rpc = $results-one-0/.., $message = "Error collecting sfp/xfp list");
+				<xsl:message terminate="yes"> ;
+			}
+			var $results-one = str:replace( $results-one-0, '\nGOT: ', '\n' );
+
+			/* search for selected xcvr index in the results */
+			var $index = {
+				uexpr jcs:regex( "\n[[:space:]]*([0-9]+)[[:space:]]*MIC\\(" _ $fpc _ "/" _ $pic _"\\)\\(" _ $xcvr _ "\\)", $results-one )[2];
+				uexpr jcs:regex( "\n[[:space:]]*([0-9]+)[[:space:]]*xfp-" _ $fpc _ "/" _ $pic _"/" _ $xcvr _ "(\n|$)", $results-one )[2];
+			}
+			/* error check if a transceiver index has been found */
+			if ( $index == "" ) {
+				call rpc_failure($message = "Packet Forwarding Engine (PFE) did not find a valid index for this transceiver. No transceiver found.");
+				<xsl:message terminate="yes"> ;
+			}
+
+			/* identify if the index is an SFP or XFP*/
+			var $type = {
+				if ( jcs:regex( "\n[[:space:]]*[0-9]+[[:space:]]*(MIC)\\(" _ $fpc _ "/" _ $pic _"\\)\\(" _ $xcvr _ "\\)", $results-one )[2] == "MIC" ) {
+					uexpr "sfp";
+				}
+				else if ( jcs:regex( "\n[[:space:]]*[0-9]+[[:space:]]*(xfp)-" _ $fpc _ "/" _ $pic _"/" _ $xcvr _ "(\n|$)", $results-one )[2] == "xfp" ) {
+					uexpr "xfp";
+				}
+				else {
+					uexpr "unknown";
+				}
+			}
+			/* error check */
+			if ( $type == "unknown") {
+				call rpc_failure($message = "Packet Forwarding Engine (PFE) could not identify the type of transceiver SFP/XFP-" _ $fpc _ "/" _ $pic _ "/" _ $xcvr);
+				<xsl:message terminate="yes"> ;
+			}
+
+			/* collect data */
+			var $req-pfe-execute-two-rpc = <request-pfe-execute> {
+				if ( $type == "sfp" ) {
+					<target> "fpc" _ $fpc;
+					<command> "show sfp " _ $index;
+				}
+				else if ( $type == "xfp" ) {
+					if (contains($version/package-information[name="junos"]/comment,"13.1X49")) {
+						<target> "fpc" _ $fpc;
+						<command> "show xfp " _ $index _ " identifier";
+						<command> "test xfp " _ $index _ " read 0 256";
+					}
+					else {
+						<target> "fpc" _ $fpc;
+						<command> "show xfp " _ $index;
+					}
+				}
+			}
+			var $results-two = jcs:execute( $connection , $req-pfe-execute-two-rpc );
+			if ($results-two/..//xnm:error) {
+				call rpc_failure($rpc = $results-two-0/.., $message = "Error collecting sfp/xfp data");
+				<xsl:message terminate="yes"> ;
+			}
+
+			/* split data into lines */
+			var $lines = jcs:break-lines( $results-two );
+
+			mvar $sfp-data;
+			if ( $type == "sfp" ) {
+				/* process data for SFP */
+				mvar $oneTimeDate = true();
+				mvar $oneTimeBitRate = true();
+				mvar $oneTimeDistance = true();
+				set $sfp-data = {
+					for-each ( $lines ) {
+						var $line = str:replace( . , 'GOT: ', '' );
+						if ( contains( $line , "  Vendor name:" ) ) {
+							<vendor-name> jcs:regex( "^[[:space:]]*Vendor name:[[:space:]]*(.*)" , $line )[2];
+						}
+						if ( contains( $line , "  PNO:" ) ) {
+							<pno> jcs:regex( "^[[:space:]]*PNO:[[:space:]]*(.*)" , $line )[2];
+						}
+/*						if ( contains( $line , "  Vendor PNO:" ) ) {
+							<vendor-pno> jcs:regex( "^[[:space:]]*Vendor PNO:[[:space:]]*(.*)" , $line )[2] ;
+						}
+*/
+						if ( contains( $line , "  SNO:" ) ) {
+							<sno> jcs:regex( "^[[:space:]]*SNO:[[:space:]]*(.*)" , $line )[2];
+						}
+						if ( contains( $line , "  Cable Type:" ) ) {
+							<cable-type> jcs:regex( "^[[:space:]]*Cable Type:[[:space:]]*(.*)" , $line )[2];
+						}
+						if ( contains( $line , "  Wavelength" ) ) {
+							<wavelength> jcs:regex( "^[[:space:]]*Wavelength[[:space:]]*(.*)" , $line )[2];
+						}
+						if ( contains( $line , "0x50:" ) && $oneTimeDate ) {
+							<manufacture-date> {
+								uexpr 20 _ (substring($line,25,2)-30) _ (substring($line,28,2)-30) _ "-" _ (substring($line,31,2)-30) _ (substring($line,34,2)-30) _ "-" _ (substring($line,39,2)-30) _ (substring($line,42,2)-30);
+							}
+							set $oneTimeDate = false();
+						}
+						if ( contains( $line , "0x00:" ) && $oneTimeBitRate ) {
+							<bit-rate> {
+								var $bitrate = call hex_to_dec( $bit1 = substring( $line , 53 , 1 ) ,  $bit2 = substring( $line , 54 , 1 ) );
+								uexpr $bitrate * 100;  /* _ " MBd"; */
+							}
+							<distance-smf-km> {
+								var $smfkm = call hex_to_dec( $bit1 = substring( $line , 59 , 1 ) ,  $bit2 = substring( $line , 60 , 1 ) );
+								if ( $smfkm == 255 ) {
+									uexpr "\u+003E 254";  /*_ " km"; */
+								}
+								else {
+									uexpr $smfkm;  /* _ " km"; */
+								}
+							}
+							<distance-smf-m> {
+								var $smfm = call hex_to_dec( $bit1 = substring( $line , 62 , 1 ) ,  $bit2 = substring( $line , 63 , 1 ) );
+								if ( $smfm == 255 ) {
+									uexpr "\u+003E 25400";  /* _ " m"; */
+								}
+								else {
+									uexpr $smfm * 100;  /* _ " m"; */
+								}
+							}
+							set $oneTimeBitRate = false();
+						}
+						if ( contains( $line , "0x10:" ) && $oneTimeDistance ) {
+							<distance-om1> {
+								var $om1 = call hex_to_dec( $bit1 = substring( $line , 14 , 1 ) ,  $bit2 = substring( $line , 15 , 1 ) );
+								if ( $om1 == 255 ) {
+									uexpr "\u+003E 2540";  /* _ " m"; */
+								}
+								else {
+									uexpr $om1 * 10;  /* _ " m"; */
+								}
+							}
+							<distance-om2> {
+								var $om2 = call hex_to_dec( $bit1 = substring( $line , 11 , 1 ) ,  $bit2 = substring( $line , 12 , 1 ) );
+								if ( $om2 == 255 ) {
+									uexpr "\u+003E 2540";  /* _ " m"; */
+								}
+								else {
+									uexpr $om2 * 10;  /* _ " m"; */
+								}
+							}
+							<distance-om3> {
+								var $om3 = call hex_to_dec( $bit1 = substring( $line , 20 , 1 ) ,  $bit2 = substring( $line , 21 , 1 ) );
+								if ( $om3 == 255 ) {
+									uexpr "\u+003E 2540";  /* _ " m"; */
+								}
+								else {
+									uexpr $om3 * 10;  /* _ " m"; */
+								}
+							}
+							<distance-direct> {
+								var $direct = call hex_to_dec( $bit1 = substring( $line , 17 , 1 ) ,  $bit2 = substring( $line , 18 , 1 ) );
+								if ( $direct == 255 ) {
+									uexpr "\u+003E 254";  /* _ " m"; */
+								}
+								else {
+									uexpr $direct;  /* _ " m"; */
+								}
+							}
+							set $oneTimeDistance = false();
+						}
+					}
+
+					<vendor-pno> {
+						if ( $vendor-results/physical-interface/optics-diagnostics-vendor-extension/optics-vendor-part-number ) {
+							uexpr $vendor-results/physical-interface/optics-diagnostics-vendor-extension/optics-vendor-part-number;
+						}
+					}
+
+					<material-number> {
+						if ( $vendor-results/physical-interface/optics-diagnostics-vendor-extension/optics-vendor-material-number ) {
+							uexpr $vendor-results/physical-interface/optics-diagnostics-vendor-extension/optics-vendor-material-number;
+						}
+					}
+				}
+			}
+			else if ( $type == "xfp" ) {
+				set $sfp-data = {
+					for-each ( $lines ) {
+						var $line = str:replace( . , 'GOT: ', '' );
+						if ( contains( $line , "  Vendor name:" ) ) {
+							<vendor-name> jcs:regex( "^[[:space:]]*Vendor name:[[:space:]]*(.*)" , $line )[2];
+						}
+						if ( contains( $line , "  Wavelength:" ) ) {
+							<wavelength> jcs:regex( "^[[:space:]]*Wavelength:[[:space:]]*(.*)" , $line )[2];
+						}
+						if (contains($version/package-information[name="junos"]/comment,"13.1X49")) {
+							if ( contains( $line , "  Juniper PN:" ) ) {
+								<pno> jcs:regex( "^[[:space:]]*Juniper PN:[[:space:]]*(.*)" , $line )[2];
+							}
+/*
+							if ( contains( $line , "  Vendor PN:" ) ) {
+								<vendor-pno> jcs:regex( "^[[:space:]]*Vendor PN:[[:space:]]*(.*)" , $line )[2] ;
+							}
+*/
+
+							if ( contains( $line , "  Vendor SN:" ) ) {
+								<sno> jcs:regex( "^[[:space:]]*Vendor SN:[[:space:]]*(.*)" , $line )[2];
+							}
+							if ( contains( $line , "  10G Ethernet:" ) ) {
+								<cable-type> jcs:regex( "^[[:space:]]*10G Ethernet:[[:space:]]*(.*)" , $line )[2];
+							}
+							if ( contains( $line , "  208:" ) ) {
+								<manufacture-date> {
+									uexpr 20 _ (substring($line,20,2)-30) _ (substring($line,23,2)-30) _ "-" _ (substring($line,26,2)-30) _ (substring($line,29,2)-30) _ "-" _ (substring($line,32,2)-30) _ (substring($line,35,2)-30);
+								}
+							}
+							if ( contains( $line , "  128:" ) ) {
+								<bit-rate-min> {
+									var $bitrate-min = call hex_to_dec( $bit1 = substring( $line , 44 , 1 ) ,  $bit2 = substring( $line , 45 , 1 ) );
+									/* uexpr jcs:printf("%4d Gb/s",(($bitrate-min * 100) div 1000)); */
+									uexpr ($bitrate-min * 100) div 1000;
+								}
+								<bit-rate-max> {
+									var $bitrate-max = call hex_to_dec( $bit1 = substring( $line , 47 , 1 ) ,  $bit2 = substring( $line , 48 , 1 ) );
+									/* uexpr jcs:printf("%4d Gb/s",(($bitrate-max * 100) div 1000)); */
+									uexpr ($bitrate-max * 100) div 1000;
+								}
+								<distance-smf-km> {
+									var $smf = call hex_to_dec( $bit1 = substring( $line , 50 , 1 ) ,  $bit2 = substring( $line , 51 , 1 ) );
+									if ( $smf == 255 ) {
+										uexpr "\u+003E 254";  /* _" km"; */
+									}
+									else {
+										uexpr $smf;  /* _ " km"; */
+									}
+								}
+								<distance-ebw> {
+									var $ebw = call hex_to_dec( $bit1 = substring( $line , 53 , 1 ) ,  $bit2 = substring( $line , 54 , 1 ) );
+									if ( $ebw == 255 ) {
+										uexpr "\u+003E 508";  /* _" m"; */
+									}
+									else {
+										uexpr $ebw * 2;  /* _ " m"; */
+									}
+								}
+							}
+							if ( contains( $line , "  144:" ) ) {
+								<distance-500> {
+									var $micron50 = call hex_to_dec( $bit1 = substring( $line , 8 , 1 ) ,  $bit2 = substring( $line , 9 , 1 ) );
+									if ( $micron50 == 255 ) {
+										uexpr "\u+003E 254";  /* _ " m"; */
+									}
+									else {
+										uexpr $micron50;  /* _ " m"; */
+									}
+								}
+								<distance-625> {
+									var $micron625 = call hex_to_dec( $bit1 = substring( $line , 11 , 1 ) ,  $bit2 = substring( $line , 12 , 1 ) );
+									if ( $micron625 == 255 ) {
+										uexpr "\u+003E 254";  /* _ " m"; */
+									}
+									else {
+										uexpr $micron625;  /* _ " m"; */
+									}
+								}
+								<distance-cu> {
+									var $cu = call hex_to_dec( $bit1 = substring( $line , 14 , 1 ) ,  $bit2 = substring( $line , 15 , 1 ) );
+									if ( $cu == 255 ) {
+										uexpr "\u+003E 254";  /* _ " m"; */
+									}
+									else {
+										uexpr $cu;  /* _ " m"; */
+									}
+								}
+							}
+						}
+						else {
+							if ( contains( $line , "  PNO:" ) ) {
+								<pno> jcs:regex( "^[[:space:]]*PNO:[[:space:]]*(.*)" , $line )[2];
+							}
+/*
+							if ( contains( $line , "  Vendor PNO:" ) ) {
+								<vendor-pno> jcs:regex( "^[[:space:]]*Vendor PNO:[[:space:]]*(.*)" , $line )[2] ;
+							}
+*/
+
+							if ( contains( $line , "  SNO:" ) ) {
+								<sno> jcs:regex( "^[[:space:]]*SNO:[[:space:]]*(.*)" , $line )[2];
+							}
+							if ( contains( $line , "  Cable type:" ) ) {
+								<cable-type> jcs:regex( "^[[:space:]]*Cable type:[[:space:]]*(.*)" , $line )[2];
+							}
+							if ( contains( $line , "0xd0:" ) ) {
+								<manufacture-date> {
+									uexpr 20 _ (substring($line,25,2)-30) _ (substring($line,28,2)-30) _ "-" _ (substring($line,31,2)-30) _ (substring($line,34,2)-30) _ "-" _ (substring($line,39,2)-30) _ (substring($line,42,2)-30);
+								}
+							}
+							if ( contains( $line , "0x80:" ) ) {
+								<bit-rate-min> {
+									var $bitrate-min = call hex_to_dec( $bit1 = substring( $line , 53 , 1 ) ,  $bit2 = substring( $line , 54 , 1 ) );
+									/* uexpr jcs:printf("%4d Gb/s",(($bitrate-min * 100) div 1000)); */
+									uexpr ($bitrate-min * 100) div 1000;
+								}
+								<bit-rate-max> {
+									var $bitrate-max = call hex_to_dec( $bit1 = substring( $line , 56 , 1 ) ,  $bit2 = substring( $line , 57 , 1 ) );
+									/* uexpr jcs:printf("%4d Gb/s",(($bitrate-max * 100) div 1000)); */
+									uexpr ($bitrate-max * 100) div 1000;
+								}
+								<distance-smf-km> {
+									var $smf = call hex_to_dec( $bit1 = substring( $line , 59 , 1 ) ,  $bit2 = substring( $line , 60 , 1 ) );
+									if ( $smf == 255 ) {
+										uexpr "\u+003E 254";  /* _" km"; */
+									}
+									else {
+										uexpr $smf;  /* _ " km"; */
+									}
+								}
+								<distance-ebw> {
+									var $ebw = call hex_to_dec( $bit1 = substring( $line , 62 , 1 ) ,  $bit2 = substring( $line , 63 , 1 ) );
+									if ( $ebw == 255 ) {
+										uexpr "\u+003E 508";  /* _" m"; */
+									}
+									else {
+										uexpr $ebw * 2;  /* _ " m"; */
+									}
+								}
+							}
+							if ( contains( $line , "0x90:" ) ) {
+								<distance-500> {
+									var $micron50 = call hex_to_dec( $bit1 = substring( $line , 11 , 1 ) ,  $bit2 = substring( $line , 12 , 1 ) );
+									if ( $micron50 == 255 ) {
+										uexpr "\u+003E 254";  /* _ " m"; */
+									}
+									else {
+										uexpr $micron50;  /* _ " m"; */
+									}
+								}
+								<distance-625> {
+									var $micron625 = call hex_to_dec( $bit1 = substring( $line , 14 , 1 ) ,  $bit2 = substring( $line , 15 , 1 ) );
+									if ( $micron625 == 255 ) {
+										uexpr "\u+003E 254";  /* _ " m"; */
+									}
+									else {
+										uexpr $micron625;  /* _ " m"; */
+									}
+								}
+								<distance-cu> {
+									var $cu = call hex_to_dec( $bit1 = substring( $line , 17 , 1 ) ,  $bit2 = substring( $line , 18 , 1 ) );
+									if ( $cu == 255 ) {
+										uexpr "\u+003E 254";  /* _ " m"; */
+									}
+									else {
+										uexpr $cu;  /* _ " m"; */
+									}
+								}
+							}
+						}
+					}
+					<vendor-pno> {
+						if ( $vendor-results/physical-interface/optics-diagnostics-vendor-extension/optics-vendor-part-number ) {
+							uexpr $vendor-results/physical-interface/optics-diagnostics-vendor-extension/optics-vendor-part-number;
+						}
+					}
+					<material-number> {
+						if ( $vendor-results/physical-interface/optics-diagnostics-vendor-extension/optics-vendor-material-number ) {
+							uexpr $vendor-results/physical-interface/optics-diagnostics-vendor-extension/optics-vendor-material-number;
+						}
+					}
+				}
+			}
+
+			/*
+			var $close-results = jcs:close ( $connection );
+			if ($close-results/..//xnm:error) {
+				call rpc_failure($rpc = $close-results/.., $message = "Error closing connection.");
+				<xsl:message terminate="yes"> ;
+			}
+			*/
+
+			if ( $format == "xml" ) {
+
+			/* var $outxml := { */
+			<interface> {
+				<name> $Interface;
+				<admin-status> $admin-status;
+				<oper-status> $oper-status;
+
+				/* output informations, part 1: vendor data etc. */
+				<sfp> {
+					<vendor-name> $sfp-data//vendor-name;
+					<manufacture-date> $sfp-data//manufacture-date;
+					<part-number> $sfp-data//pno;
+					<vendor-part-number> $sfp-data//vendor-pno;
+					<serial-number> $sfp-data//sno;
+					<cable-type> $sfp-data//cable-type;
+					<wavelength> $sfp-data//wavelength;
+					<material-number> $sfp-data//material-number;
+					if ( $type == "sfp" ) {
+						<bit-rate> $sfp-data//bit-rate;
+						<distances> {
+							<smf-km> $sfp-data//distance-smf-km;
+							<smf-m> $sfp-data//distance-smf-m;
+							<om1> $sfp-data//distance-om1;
+							<om2> $sfp-data//distance-om2;
+							<om3> $sfp-data//distance-om3;
+							<direct> $sfp-data//distance-direct;
+						}
+					}
+					else if ( $type == "xfp" ) {
+						<bit-rate-min> $sfp-data//bit-rate-min;
+						<bit-rate-max> $sfp-data//bit-rate-max;
+						<distances> {
+							<smf-km> $sfp-data//distance-smf-km;
+							<ebw> $sfp-data//distance-ebw;
+							<distance-500> $sfp-data//distance-500;
+							<distance-625> $sfp-data//distance-625;
+							<copper> $sfp-data//distance-cu;
+						}
+					}
+				} /* <sfp> */
+
+				/* output informations, part 2: level data (laser etc.) */
+				<level> {
+					/* Go through each valid result that doesnt contain N/A */
+					for-each ($results/physical-interface) {
+						if ( optics-diagnostics ) {
+							expr "\n   ";
+							/* copy all children of subtree optics-diagnostics from $results to output xml */
+							for-each ( optics-diagnostics/child::node() ) {
+								var $tag = name(.);
+								var $text = ./text();
+								if ( !jcs:empty($tag) ) {
+									var $raw = {
+										uexpr "<" _ $tag _ ">";
+										expr $text;
+										uexpr "</" _ $tag _ ">\n";
+									}
+									var $elem = ext:node-set($raw);
+									expr "  ";
+									copy-of $elem;
+								}
+								expr "   ";
+	/*
+								if ( $tag != "" ) {
+								uexpr "<" _ $tag _ ">";
+								expr $text;
+								uexpr "</" _ $tag _ ">\n";
+								}
+	*/
+							}
+						}
+					}
+				} /* <level> */
+			} /* <interface> */
+			/* } */ /* var $outxml := */
+/* uexpr xutil:xml-to-string($outxml); */
+
+			} /* if $format ... */
+			else {
+
+			<html> {
+				<head lang="en"> {
+					<title> "Informations for BNG " _ $myDevice _ ".";
+					copy-of bcersows:insertCSS();
+					copy-of bcersows:insertJS();
+					copy-of bcersows:insertExportWindowButton();
+					/* copy-of jspace:html-style("6"); */
+					<style type="text/css"> {
+						<xsl:text disable-output-escaping="yes"> "
+							.info-table {
+								border-collapse: collapse;
+								width: 80%;
+							}
+							.info-table tr:first-child {
+								font-weight: bold;
+							}
+							.info-table tr:nth-child(even) {
+								background-color: #f0f0f0;
+							}
+							.info-table td {
+								padding: 3px;
+							}
+							.tdleft {
+								text-align: left;
+							}
+							.tdright {
+								text-align: right;
+							}
+							.tdcenter {
+								text-align: center;
+							}"
+						;
+					}
+				}
+				<body lang="en"> {
+					copy-of bcersows:insertHeaderBig( $myDevice );
+					copy-of bcersows:insertCompletionTest();
+
+					copy-of bcersows:insertSoftwareInformation( $connection );
+
+					<p class="bold"> "Optical Port Information";
+
+					<table class="twoColumnTable wide info-table"> {
+						<colgroup> {
+							<col width="40%">;
+							<col width="60%">;
+						}
+						<tr> {
+							<td class="tdleft"> "Interface Name";
+							<td class="tdleft"> $Interface;
+						}
+						<tr> {
+							<td class="tdleft"> "Vendor Name";
+							<td class="tdleft"> $sfp-data//vendor-name;
+						}
+						<tr> {
+							<td class="tdleft"> "Manufacture Date";
+							<td class="tdleft"> $sfp-data//manufacture-date;
+						}
+						<tr> {
+							<td class="tdleft"> "Part Number";
+							<td class="tdleft"> $sfp-data//pno;
+						}
+						<tr> {
+							<td class="tdleft"> "Vendor Part Number";
+							<td class="tdleft"> $sfp-data//vendor-pno;
+						}
+						<tr> {
+							<td class="tdleft"> "Serial Number";
+							<td class="tdleft"> $sfp-data//sno;
+						}
+						<tr> {
+							<td class="tdleft"> "Cable Type";
+							<td class="tdleft"> $sfp-data//cable-type;
+						}
+						<tr> {
+							<td class="tdleft"> "Material Number";
+							<td class="tdleft"> $sfp-data//material-number;
+						}
+						<tr> {
+							<td class="tdleft"> "Wavelength";
+							<td class="tdleft"> $sfp-data//wavelength;
+						}
+						if ( $type == "sfp" ) {
+							<tr> {
+								<td class="tdleft"> "Bit Rate Nominal";
+								<td class="tdleft"> $sfp-data//bit-rate;
+							}
+						}
+						else if ( $type == "xfp" ) {
+							<tr> {
+								<td class="tdleft"> "Bit Rate Minimum";
+								<td class="tdleft"> $sfp-data//bit-rate-min;
+							}
+							<tr> {
+								<td class="tdleft"> "Bit Rate Maximum";
+								<td class="tdleft"> $sfp-data//bit-rate-max;
+							}
+						}
+						<tr> {
+							<td class="tdleft"> "Distances:";
+						}
+						<tr> {
+							<td class="tdright"> "SMF (km)";
+							<td class="tdleft"> $sfp-data//distance-smf-km;
+						}
+						if ( $type == "sfp" ) {
+							<tr> {
+								<td class="tdright"> "SMF (m)";
+								<td class="tdleft"> $sfp-data//distance-smf-m;
+							}
+							<tr> {
+								<td class="tdright"> "OM1 (m)";
+								<td class="tdleft"> $sfp-data//distance-om1;
+							}
+							<tr> {
+								<td class="tdright"> "OM2 (m)";
+								<td class="tdleft"> $sfp-data//distance-om2;
+							}
+							<tr> {
+								<td class="tdright"> "OM3 (m)";
+								<td class="tdleft"> $sfp-data//distance-om3;
+							}
+							<tr> {
+								<td class="tdright"> "Direct (m)";
+								<td class="tdleft"> $sfp-data//distance-direct;
+							}
+						}
+						else if ( $type == "xfp" ) {
+							<tr> {
+								<td class="tdright"> "EBW (m)";
+								<td class="tdleft"> $sfp-data//distance-ebw;
+							}
+							<tr> {
+								<td class="tdright"> "50 (m)";
+								<td class="tdleft"> $sfp-data//distance-500;
+							}
+							<tr> {
+								<td class="tdright"> "625 (m)";
+								<td class="tdleft"> $sfp-data//distance-625;
+							}
+							<tr> {
+								<td class="tdright"> "Copper (m)";
+								<td class="tdleft"> $sfp-data//distance-cu;
+							}
+						}
+					}
+
+
+					for-each ($results/physical-interface) {
+						<br>;
+						<table class="twoColumnTable wide info-table"> {
+							/* Setup the column width for a 2 column table */
+							<colgroup> {
+								<col width="40%">;
+								<col width="60%">;
+							}
+							<tr> {
+								<td class="tdleft"> "Optics Diagnostics for physical interface";
+								<td class="tdleft"> name;
+							}
+							/*
+							if ( $vendor-results/physical-interface/optics-diagnostics-vendor-extension/optics-vendor-part-number ) {
+								<tr> {
+									<td class="tdleft"> "Vendor part number";
+									<td class="tdleft"> $vendor-results/physical-interface/optics-diagnostics-vendor-extension/optics-vendor-part-number;
+								}
+							}
+							if ( $vendor-results/physical-interface/optics-diagnostics-vendor-extension/optics-vendor-material-number ) {
+								<tr> {
+									<td class="tdleft"> "Vendor material number";
+									<td class="tdleft"> $vendor-results/physical-interface/optics-diagnostics-vendor-extension/optics-vendor-material-number;
+								}
+							}
+							*/
+
+							var $o = ./optics-diagnostics;
+							if ( $o/laser-bias-current ) {
+								<tr> {
+									<td class="tdleft"> "Laser bias current";
+									if ( 
+										( $o/laser-bias-current < $o/laser-bias-current-low-alarm-threshold )  or
+										( $o/laser-bias-current > $o/laser-bias-current-high-alarm-threshold )
+									) {
+										<td class="cellwarningleft"> $o/laser-bias-current _ " mA";
+									}
+									else if ( 
+										( $o/laser-bias-current < $o/laser-bias-current-low-warn-threshold )  or
+										( $o/laser-bias-current > $o/laser-bias-current-high-warn-threshold ) 
+									) {
+										<td class="cellamberleft"> $o/laser-bias-current _ " mA";
+									}
+									else {
+										<td class="tdleft"> $o/laser-bias-current _ " mA";
+									}
+								}
+							}
+							if ( $o/laser-output-power or $o/laser-output-power-dbm ) {
+								<tr> {
+									<td class="tdleft"> "Laser output power";
+									if ( 
+										( $o/laser-output-power-dbm < $o/laser-tx-power-low-alarm-threshold-dbm )  or
+										( $o/laser-output-power-dbm > $o/laser-tx-power-high-alarm-threshold-dbm )  or
+										( $o/laser-output-power < $o/laser-tx-power-low-alarm-threshold )   or
+										( $o/laser-output-power > $o/laser-tx-power-high-alarm-threshold ) 
+									) {
+										<td class="cellwarningleft"> $o/laser-output-power _ " mW / " _ $o/laser-output-power-dbm _ " dBm";
+									}
+									else if ( 
+										( $o/laser-output-power-dbm < $o/laser-tx-power-low-warn-threshold-dbm )  or
+										( $o/laser-output-power-dbm > $o/laser-tx-power-high-warn-threshold-dbm )  or
+										( $o/laser-output-power < $o/laser-tx-power-low-warn-threshold )  or
+										( $o/laser-output-power > $o/laser-tx-power-high-warn-threshold ) 
+									) {
+										<td class="cellamberleft"> $o/laser-output-power _ " mW / " _ $o/laser-output-power-dbm _ " dBm";
+									}
+									else {
+										<td class="tdleft"> $o/laser-output-power _ " mW / " _ $o/laser-output-power-dbm _ " dBm";
+									}
+								}
+							}
+							if ( $o/module-temperature ) {
+								<tr> {
+									<td class="tdleft"> "Module temperature";
+									if ( 
+										( $o/module-temperature < $o/module-temperature-low-alarm-threshold )  or
+										( $o/module-temperature > $o/module-temperature-high-alarm-threshold ) 
+									) {
+										<td class="cellwarningleft"> $o/module-temperature;
+									}
+									else if ( 
+										( $o/module-temperature < $o/module-temperature-low-warn-threshold )  or
+										( $o/module-temperature > $o/module-temperature-high-warn-threshold ) 
+									) {
+										<td class="cellamberleft"> $o/module-temperature;
+									}
+									else {
+										<td class="tdleft"> $o/module-temperature;
+									}
+								}
+							}
+							if ($o/module-voltage) {
+								<tr> {
+									<td class="tdleft"> "Module voltage";
+									if ( 
+										( $o/module-voltage < $o/module-voltage-low-alarm-threshold )  or
+										( $o/module-voltage > $o/module-voltage-high-alarm-threshold ) 
+									) {
+										<td class="cellwarningleft"> $o/module-voltage _ " V";
+									}
+									else if ( 
+										( $o/module-voltage < $o/module-voltage-low-warn-threshold )  or
+										( $o/module-voltage > $o/module-voltage-high-warn-threshold ) 
+									) {
+										<td class="cellamberleft"> $o/module-voltage _ " V";
+									}
+									else {
+										<td class="tdleft"> $o/module-voltage _ " V";
+									}
+								}
+							}
+							if ( $o/rx-signal-avg-optical-power or $o/rx-signal-avg-optical-power-dbm ) {
+								<tr> {
+									<td class="tdleft"> "Receiver signal average optical power";
+									if ( 
+										( $o/rx-signal-avg-optical-power-dbm < $o/laser-rx-power-low-alarm-threshold-dbm )  or
+										( $o/rx-signal-avg-optical-power-dbm > $o/laser-rx-power-high-alarm-threshold-dbm )  or
+										( $o/rx-signal-avg-optical-power < $o/laser-rx-power-low-alarm-threshold )  or
+										( $o/rx-signal-avg-optical-power > $o/laser-rx-power-high-alarm-threshold ) 
+									) {
+										<td class="cellwarningleft"> $o/rx-signal-avg-optical-power _ " mW / " _ $o/rx-signal-avg-optical-power-dbm _ " dBm";
+									}
+									else if ( 
+										( $o/rx-signal-avg-optical-power-dbm < $o/laser-rx-power-low-warn-threshold-dbm )  or
+										( $o/rx-signal-avg-optical-power-dbm > $o/laser-rx-power-high-warn-threshold-dbm )  or
+										( $o/rx-signal-avg-optical-power < $o/laser-rx-power-low-warn-threshold )  or
+										( $o/rx-signal-avg-optical-power > $o/laser-rx-power-high-warn-threshold ) 
+									) {
+										<td class="cellamberleft"> $o/rx-signal-avg-optical-power _ " mW / " _ $o/rx-signal-avg-optical-power-dbm _ " dBm";
+									}
+									else {
+										<td class="tdleft"> $o/rx-signal-avg-optical-power _ " mW / " _ $o/rx-signal-avg-optical-power-dbm _ " dBm";
+									}
+								}
+							}
+							if ( $o/laser-rx-optical-power  or  $o/laser-rx-optical-power-dbm ) {
+								<tr> {
+									<td class="tdleft"> "Laser rx power";
+									if ( 
+										( $o/laser-rx-optical-power-dbm < $o/laser-rx-power-low-alarm-threshold-dbm )  or
+										( $o/laser-rx-optical-power-dbm > $o/laser-rx-power-high-alarm-threshold-dbm )  or
+										( $o/laser-rx-optical-power < $o/laser-rx-power-low-alarm-threshold )  or
+										( $o/laser-rx-optical-power > $o/laser-rx-power-high-alarm-threshold )
+									) {
+										<td class="cellwarningleft"> $o/laser-rx-optical-power _ " mW / " _ $o/laser-rx-optical-power-dbm _ " dBm";
+									}
+									else if (
+										( $o/laser-rx-optical-power-dbm < $o/laser-rx-power-low-warn-threshold-dbm )  or
+										( $o/laser-rx-optical-power-dbm > $o/laser-rx-power-high-warn-threshold-dbm )  or
+										( $o/laser-rx-optical-power < $o/laser-rx-power-low-warn-threshold )  or
+										( $o/laser-rx-optical-power > $o/laser-rx-power-high-warn-threshold )
+									) {
+										<td class="cellamberleft"> $o/laser-rx-optical-power _ " mW / " _ $o/laser-rx-optical-power-dbm _ " dBm";
+									}
+									else {
+										<td class="tdleft"> $o/laser-rx-optical-power _ " mW / " _ $o/laser-rx-optical-power-dbm _ " dBm";
+									}
+								}
+							}
+							if ( $o/laser-bias-current-high-alarm ) {
+								<tr> {
+									<td class="tdleft"> "Laser bias current high alarm";
+									if (jcs:printf( "%jcs" , $o/laser-bias-current-high-alarm ) = "Off") {
+										<td class="tdleft"> jcs:printf( "%jcs" , $o/laser-bias-current-high-alarm );
+									}
+									else {
+										<td class="cellwarningleft"> jcs:printf( "%jcs" , $o/laser-bias-current-high-alarm );
+									}
+								}
+							}
+							if ( $o/laser-bias-current-low-alarm ) {
+								<tr> {
+									<td class="tdleft"> {
+										expr "Laser bias current low alarm";
+									}
+									if ( jcs:printf( "%jcs" , $o/laser-bias-current-low-alarm ) = "Off" ) {
+										<td class="tdleft"> jcs:printf( "%jcs" , $o/laser-bias-current-low-alarm );
+									}
+									else {
+										<td class="cellwarningleft"> jcs:printf( "%jcs" , $o/laser-bias-current-low-alarm );
+									}
+								}
+							}
+							if ( $o/laser-bias-current-high-warn ) {
+								<tr> {
+									<td class="tdleft"> "Laser bias current high warning";
+									if (jcs:printf( "%jcs" , $o/laser-bias-current-high-warn )="Off") {
+										<td class="tdleft"> jcs:printf( "%jcs" , $o/laser-bias-current-high-warn );
+									}
+									else {
+										<td class="cellamberleft"> jcs:printf( "%jcs" , $o/laser-bias-current-high-warn );
+									}
+								}
+							}
+							if ( $o/laser-bias-current-low-warn ) {
+								<tr> {
+									<td class="tdleft"> "Laser bias current low warning";
+									if ( jcs:printf( "%jcs" , $o/laser-bias-current-low-warn ) = "Off" ) {
+										<td class="tdleft"> jcs:printf( "%jcs" , $o/laser-bias-current-low-warn );
+									}
+									else {
+										<td class="cellamberleft"> jcs:printf( "%jcs" , $o/laser-bias-current-low-warn );
+									}
+								}
+							}
+							if ( $o/laser-tx-power-high-alarm ) {
+								<tr> {
+									<td class="tdleft"> "Laser output power high alarm";
+									if ( jcs:printf( "%jcs" , $o/laser-tx-power-high-alarm ) = "Off" ) {
+										<td class="tdleft"> jcs:printf( "%jcs" , $o/laser-tx-power-high-alarm );
+									}
+									else {
+										<td class="cellwarningleft"> jcs:printf( "%jcs" , $o/laser-tx-power-high-alarm );
+									}
+								}
+							}
+							if ( $o/laser-tx-power-low-alarm ) {
+								<tr> {
+									<td class="tdleft"> "Laser output power low alarm";
+									if ( jcs:printf( "%jcs" , $o/laser-tx-power-low-alarm ) = "Off" ) {
+										<td class="tdleft"> jcs:printf( "%jcs" , $o/laser-tx-power-low-alarm );
+									}
+									else {
+										<td class="cellwarningleft"> jcs:printf( "%jcs" , $o/laser-tx-power-low-alarm );
+									}
+								}
+							}
+							if ( $o/laser-tx-power-high-warn ) {
+								<tr> {
+									<td class="tdleft"> "Laser output power high warning";
+									if ( jcs:printf( "%jcs" , $o/laser-tx-power-high-warn ) = "Off" ) {
+										<td class="tdleft"> jcs:printf( "%jcs" , $o/laser-tx-power-high-warn );
+									}
+									else {
+										<td class="cellamberleft"> jcs:printf( "%jcs" , $o/laser-tx-power-high-warn );
+									}
+								}
+							}
+							if ( $o/laser-tx-power-low-warn ) {
+								<tr> {
+									<td class="tdleft"> "Laser output power low warning";
+									if ( jcs:printf( "%jcs" , $o/laser-tx-power-low-warn ) = "Off" ) {
+										<td class="tdleft"> jcs:printf( "%jcs" , $o/laser-tx-power-low-warn );
+									}
+									else {
+										<td class="cellamberleft"> jcs:printf( "%jcs" , $o/laser-tx-power-low-warn );
+									}
+								}
+							}
+							if ( $o/module-temperature-high-alarm ) {
+								<tr> {
+									<td class="tdleft"> "Module temperature high alarm";
+									if ( jcs:printf( "%jcs" , $o/module-temperature-high-alarm ) = "Off" ) {
+										<td class="tdleft"> jcs:printf( "%jcs" , $o/module-temperature-high-alarm );
+									}
+									else {
+										<td class="cellwarningleft"> jcs:printf( "%jcs" , $o/module-temperature-high-alarm );
+									}
+								}
+							}
+							if ( $o/module-temperature-low-alarm ) {
+								<tr> {
+									<td class="tdleft"> "Module temperature low alarm";
+									if ( jcs:printf( "%jcs" , $o/module-temperature-low-alarm ) = "Off" ) {
+										<td class="tdleft"> jcs:printf( "%jcs" , $o/module-temperature-low-alarm );
+									}
+									else {
+										<td class="cellwarningleft"> jcs:printf( "%jcs" , $o/module-temperature-low-alarm );
+									}
+								}
+							}
+							if ( $o/module-temperature-high-warn ) {
+								<tr> {
+									<td class="tdleft"> "Module temperature high warning";
+									if ( jcs:printf( "%jcs" , $o/module-temperature-high-warn ) = "Off" ) {
+										<td class="tdleft"> jcs:printf( "%jcs" , $o/module-temperature-high-warn );
+									}
+									else {
+										<td class="cellamberleft"> jcs:printf( "%jcs" , $o/module-temperature-high-warn );
+									}
+								}
+							}
+							if ( $o/module-temperature-low-warn ) {
+								<tr> {
+									<td class="tdleft"> "Module temperature low warning";
+									if ( jcs:printf( "%jcs" , $o/module-temperature-low-warn ) = "Off" ) {
+										<td class="tdleft"> jcs:printf( "%jcs" , $o/module-temperature-low-warn );
+									}
+									else {
+										<td class="cellamberleft"> jcs:printf( "%jcs" , $o/module-temperature-low-warn );
+									}
+								}
+							}
+							if ( $o/module-voltage-high-alarm ) {
+								<tr> {
+									<td class="tdleft"> "Module voltage high alarm";
+									if ( jcs:printf( "%jcs" , $o/module-voltage-high-alarm ) = "Off" ) {
+										<td class="tdleft"> jcs:printf( "%jcs" , $o/module-voltage-high-alarm );
+									}
+									else {
+										<td class="cellwarningleft"> jcs:printf( "%jcs" , $o/module-voltage-high-alarm );
+									}
+								}
+							}
+							if ( $o/module-voltage-low-alarm ) {
+								<tr> {
+									<td class="tdleft"> "Module voltage low alarm";
+									if ( jcs:printf( "%jcs" , $o/module-voltage-low-alarm ) = "Off" ) {
+										<td class="tdleft"> jcs:printf( "%jcs" , $o/module-voltage-low-alarm );
+									}
+									else {
+										<td class="cellwarningleft"> jcs:printf( "%jcs" , $o/module-voltage-low-alarm );
+									}
+								}
+							}
+							if ( $o/module-voltage-high-warn ) {
+								<tr> {
+									<td class="tdleft"> "Module voltage high warning";
+									if ( jcs:printf( "%jcs" , $o/module-voltage-high-warn ) = "Off" ) {
+										<td class="tdleft"> jcs:printf( "%jcs" , $o/module-voltage-high-warn );
+									}
+									else {
+										<td class="cellamberleft"> jcs:printf( "%jcs" , $o/module-voltage-high-warn );
+									}
+								}
+							}
+							if ( $o/module-voltage-low-warn ) {
+								<tr> {
+									<td class="tdleft"> "Module voltage low warning";
+									if ( jcs:printf( "%jcs" , $o/module-voltage-low-warn ) = "Off" ) {
+										<td class="tdleft"> jcs:printf( "%jcs" , $o/module-voltage-low-warn );
+									}
+									else {
+										<td class="cellamberleft"> jcs:printf( "%jcs" , $o/module-voltage-low-warn );
+									}
+								}
+							}
+							if ( $o/laser-rx-power-high-alarm ) {
+								<tr> {
+									<td class="tdleft"> "Laser rx power high alarm";
+									if ( jcs:printf( "%jcs" , $o/laser-rx-power-high-alarm ) = "Off" ) {
+										<td class="tdleft"> jcs:printf( "%jcs" , $o/laser-rx-power-high-alarm );
+									}
+									else {
+										<td class="cellwarningleft"> jcs:printf( "%jcs" , $o/laser-rx-power-high-alarm );
+									}
+								}
+							}
+							if ( $o/laser-rx-power-low-alarm ) {
+								<tr> {
+									<td class="tdleft"> "Laser rx power low alarm";
+									if ( jcs:printf( "%jcs" , $o/laser-rx-power-low-alarm ) = "Off" ) {
+										<td class="tdleft"> jcs:printf( "%jcs" , $o/laser-rx-power-low-alarm );
+									}
+									else {
+										<td class="cellwarningleft"> jcs:printf( "%jcs" , $o/laser-rx-power-low-alarm );
+									}
+								}
+							}
+							if ( $o/laser-rx-power-high-warn ) {
+								<tr> {
+									<td class="tdleft"> "Laser rx power high warning";
+									if ( jcs:printf( "%jcs" , $o/laser-rx-power-high-warn ) = "Off" ) {
+										<td class="tdleft"> jcs:printf( "%jcs" , $o/laser-rx-power-high-warn );
+									}
+									else {
+										<td class="cellamberleft"> jcs:printf( "%jcs" , $o/laser-rx-power-high-warn );
+									}
+								}
+							}
+							if ( $o/laser-rx-power-low-warn ) {
+								<tr> {
+									<td class="tdleft"> "Laser rx power low warning";
+									if ( jcs:printf( "%jcs" , $o/laser-rx-power-low-warn ) = "Off" ) {
+										<td class="tdleft"> jcs:printf( "%jcs" , $o/laser-rx-power-low-warn );
+									}
+									else {
+										<td class="cellamberleft"> jcs:printf( "%jcs" , $o/laser-rx-power-low-warn );
+									}
+								}
+							}
+							if ( $o/laser-bias-current-high-alarm-threshold ) {
+								<tr> {
+									<td class="tdleft"> "Laser bias current high alarm threshold";
+									<td class="tdleft"> $o/laser-bias-current-high-alarm-threshold _ " mA";
+								}
+							}
+							if ( $o/laser-bias-current-low-alarm-threshold ) {
+								<tr> {
+									<td class="tdleft"> "Laser bias current low alarm threshold";
+									<td class="tdleft"> $o/laser-bias-current-low-alarm-threshold _ " mA";
+								}
+							}
+							if ( $o/laser-bias-current-high-warn-threshold ) {
+								<tr> {
+									<td class="tdleft"> "Laser bias current high warning threshold";
+									<td class="tdleft"> $o/laser-bias-current-high-warn-threshold _ " mA";
+								}
+							}
+							if ( $o/laser-bias-current-low-warn-threshold ) {
+								<tr> {
+									<td class="tdleft"> "Laser bias current low warning threshold";
+									<td class="tdleft"> $o/laser-bias-current-low-warn-threshold _ " mA";
+								}
+							}
+							if ( $o/laser-tx-power-high-alarm-threshold or $o/laser-tx-power-high-alarm-threshold-dbm ) {
+								<tr> {
+									<td class="tdleft"> "Laser output power high alarm threshold";
+									<td class="tdleft"> $o/laser-tx-power-high-alarm-threshold _ " mW / " _ $o/laser-tx-power-high-alarm-threshold-dbm _ " dBm";
+								}
+							}
+							if ( $o/laser-tx-power-low-alarm-threshold or $o/laser-tx-power-low-alarm-threshold-dbm ) {
+								<tr> {
+									<td class="tdleft"> "Laser output power low alarm threshold";
+									<td class="tdleft"> $o/laser-tx-power-low-alarm-threshold _ " mW / " _ $o/laser-tx-power-low-alarm-threshold-dbm _ " dBm";
+								}
+							}
+							if ( $o/laser-tx-power-high-warn-threshold or $o/laser-tx-power-high-warn-threshold-dbm ) {
+								<tr> {
+									<td class="tdleft"> "Laser output power high warning threshold";
+									<td class="tdleft"> $o/laser-tx-power-high-warn-threshold _ " mW / " _ $o/laser-tx-power-high-warn-threshold-dbm _ " dBm";
+								}
+							}
+							if ( $o/laser-tx-power-low-warn-threshold or $o/laser-tx-power-low-warn-threshold-dbm ) {
+								<tr> {
+									<td class="tdleft"> "Laser output power low warning threshold";
+									<td class="tdleft"> $o/laser-tx-power-low-warn-threshold _ " mW / " _ $o/laser-tx-power-low-warn-threshold-dbm _ " dBm";
+								}
+							}
+							if ( $o/module-temperature-high-alarm-threshold ) {
+								<tr> {
+									<td class="tdleft"> "Module temperature high alarm threshold";
+									<td class="tdleft"> $o/module-temperature-high-alarm-threshold;
+								}
+							}
+							if ( $o/module-temperature-low-alarm-threshold ) {
+								<tr> {
+									<td class="tdleft"> "Module temperature low alarm threshold";
+									<td class="tdleft"> $o/module-temperature-low-alarm-threshold;
+								}
+							}
+							if ( $o/module-temperature-high-warn-threshold ) {
+								<tr> {
+									<td class="tdleft"> "Module temperature high warning threshold";
+									<td class="tdleft"> $o/module-temperature-high-warn-threshold;
+								}
+							}
+							if ( $o/module-temperature-low-warn-threshold ) {
+								<tr> {
+									<td class="tdleft"> "Module temperature low warning threshold";
+									<td class="tdleft"> $o/module-temperature-low-warn-threshold;
+								}
+							}
+							if ( $o/module-voltage-high-alarm-threshold ) {
+								<tr> {
+									<td class="tdleft"> "Module voltage high alarm threshold";
+									<td class="tdleft"> $o/module-voltage-high-alarm-threshold _ " V";
+								}
+							}
+							if ( $o/module-voltage-low-alarm-threshold ) {
+								<tr> {
+									<td class="tdleft"> "Module voltage low alarm threshold";
+									<td class="tdleft"> $o/module-voltage-low-alarm-threshold _ " V";
+								}
+							}
+							if ( $o/module-voltage-high-warn-threshold ) {
+								<tr> {
+									<td class="tdleft"> "Module voltage high warning threshold";
+									<td class="tdleft"> $o/module-voltage-high-warn-threshold _ " V";
+								}
+							}
+							if ( $o/module-voltage-low-warn-threshold ) {
+								<tr> {
+									<td class="tdleft"> "Module voltage low warning threshold";
+									<td class="tdleft"> $o/module-voltage-low-warn-threshold _ " V";
+								}
+							}
+							if ( $o/laser-rx-power-high-alarm-threshold or $o/laser-rx-power-high-alarm-threshold-dbm ) {
+								<tr> {
+									<td class="tdleft"> "Laser rx power high alarm threshold";
+									<td class="tdleft"> $o/laser-rx-power-high-alarm-threshold _ " mW / " _ $o/laser-rx-power-high-alarm-threshold-dbm _ " dBm";
+								}
+							}
+							if ( $o/laser-rx-power-low-alarm-threshold or $o/laser-rx-power-low-alarm-threshold-dbm ) {
+								<tr> {
+									<td class="tdleft"> "Laser rx power low alarm threshold";
+									<td class="tdleft"> $o/laser-rx-power-low-alarm-threshold _ " mW / " _ $o/laser-rx-power-low-alarm-threshold-dbm _ " dBm";
+								}
+							}
+							if ( $o/laser-rx-power-high-warn-threshold or $o/laser-rx-power-high-warn-threshold-dbm ) {
+								<tr> {
+									<td class="tdleft"> "Laser rx power high warning threshold";
+									<td class="tdleft"> $o/laser-rx-power-high-warn-threshold _ " mW / " _ $o/laser-rx-power-high-warn-threshold-dbm _ " dBm";
+								}
+							}
+							if ( $o/laser-rx-power-low-warn-threshold or $o/laser-rx-power-low-warn-threshold-dbm ) {
+								<tr> {
+									<td class="tdleft"> "Laser rx power low warning threshold";
+									<td class="tdleft"> $o/laser-rx-power-low-warn-threshold _ " mW / " _ $o/laser-rx-power-low-warn-threshold-dbm _ " dBm";
+								}
+							}
+						} /* Table */
+					}
+
+					var $duration = date:seconds() - date:seconds( $localtime );
+					<div class="wholeLine"> {
+						<span class="left italic unselectable"> "vs. 1.4";
+						expr "Execution time: " _ $duration _ "s. ";
+					}
+				} /* <body> */
+			} /* <html> */
+
+
+			} /* if $format ... else ... */
+
+			expr jcs:close( $connection );
+		} /* <output> */
+	}
+}
+
+
+/* Convert a single hex value to a decimal value */
+template hex_to_dec( $bit1 , $bit2 ) {
+	var $dec1 = {
+		if ($bit1 == "a" || $bit1 == "A") {
+			uexpr "10";
+		}
+		else if ($bit1 == "b" || $bit1 == "B") {
+			uexpr "11";
+		}
+		else if ($bit1 == "c" || $bit1 == "C") {
+			uexpr "12";
+		}
+		else if ($bit1 == "d" || $bit1 == "D") {
+			uexpr "13";
+		}
+		else if ($bit1 == "e" || $bit1 == "E") {
+			uexpr "14";
+		}
+		else if ($bit1 == "f" || $bit1 == "F") {
+			uexpr "15";
+		}
+		else {
+			uexpr $bit1;
+		}
+	}
+	var $dec2 = {
+		if ($bit2 == "a" || $bit2 == "A") {
+			uexpr "10";
+		}
+		else if ($bit2 == "b" || $bit2 == "B") {
+			uexpr "11";
+		}
+		else if ($bit2 == "c" || $bit2 == "C") {
+			uexpr "12";
+		}
+		else if ($bit2 == "d" || $bit2 == "D") {
+			uexpr "13";
+		}
+		else if ($bit2 == "e" || $bit2 == "E") {
+			uexpr "14";
+		}
+		else if ($bit2 == "f" || $bit2 == "F") {
+			uexpr "15";
+		}
+		else {
+			uexpr $bit2;
+		}
+	}
+	uexpr (( 16 * $dec1) + (1 * $dec2));
+}
+
+
+template rpc_failure($rpc, $message = "Following errors occurred while trying to gather data: ", $stdout = false(), $syslog = false() ) {
+	<error> {
+		expr $message;
+		for-each ($rpc//xnm:error) {
+			expr message;
+		}
+	}
+	if ( $syslog ) {
+		expr jcs:syslog("daemon.error", $message);
+	}
+	if ( $stdout ) {
+		expr $message;
+		expr "\n";
+	}
+	for-each ($rpc//xnm:error) {
+		if ( $syslog ) {
+			expr jcs:syslog("daemon.error", message);
+		}
+		if ( $stdout ) {
+			expr message;
+			expr "\n";
+		}
+	}
+}
+
+/*
+Vasilev.Artem@ZSBJ13> show interfaces diagnostics optics vendor-extension
+Physical interface: ge-4/0/0
+    Vendor part number                        :  V50017-U5440-K500
+    Vendor material number                    :  T-UniSFP40252099
+...
+*/

@@ -1,0 +1,231 @@
+/* 	
+	Checks if an Access Node (port) was migrated correctly.
+*/
+
+/*
+	Author: bcersows
+	Version: 1.0
+	Date: 18.09.2015
+	Last Modified By: bcersows
+	###Interface Support - Check AN Port Migration.slax;v1.0;2015.09.18
+*/
+
+/*
+	Changelog:
+	----------
+	1.0; 28.07.2015: 
+		- First version.
+		11.08.2015:
+		- ANCP neighbor count updated. Showing 0 when no session.
+		16.09.2015:
+		- Added IF description to output.
+		17.09.2015:
+		- Aaaand removed it again. -.-
+*/
+
+version 1.1;
+
+ns junos = "http://xml.juniper.net/junos/*/junos";
+ns xnm = "http://xml.juniper.net/xnm/1.1/xnm";
+ns jcs = "http://xml.juniper.net/junos/commit-scripts/1.0";
+/*ns slax = "http://xml.libslax.org/slax";*/
+ns date = "http://exslt.org/dates-and-times";
+ns str = "http://exslt.org/strings";
+
+ns bcersows = "http://bcersows@telekom.de";
+import "Space_Library-Local.slax";
+import "../import/junos.xsl";
+
+/* @CONTEXT = "/device[matches(name, '\w{3}J\d{2,3}') or matches(name, '^(bng|BNG).*$')]/interface-information/physical-interface[starts-with(name, 'xe-') or starts-with(name, 'ge-')]" */
+/* @NAME = "Interface Support - Check AN Migration" */
+/* @DESCRIPTION = "Checks if an Access Node (port) was migrated correctly." */
+/* @CATEGORY = "D02 Show" */
+/* @ISLOCAL = "true" */
+/* @EXECUTIONTYPE = "SINGLEEXECUTION" */
+/* @PROMOTE="yes" */
+/* @VARIABLECONTEXT = "[{'name':'AccessNodeAddress','defaultvalue':'10.1.1.2'}]" */
+
+mvar $counter = 0;
+mvar $rpc;
+mvar $results;
+
+var $arguments = {
+	<argument> {
+		<name> "CONTEXT";
+		<description> "Context of script execution";
+	}
+}
+param $CONTEXT;
+
+match / {
+	<op-script-results> {
+		mvar $localtime = date:date-time();
+	
+		var $myDevice = {
+			expr jcs:regex( "/device\\[name=\"([^\"]*)\"\\].*", $CONTEXT )[2];
+		}
+		
+		var $connection = jcs:open();
+		if ($connection/..//xnm:error) {
+			<error> "Error connecting on mgd on this RE";
+			<xsl:message terminate="yes"> ;
+		}
+		
+		mvar $break = false();
+		mvar $breakReason = "";
+		
+		<output> {
+			<html> {
+				<head lang="en"> {
+					<title> "Informations for BNG " _ $myDevice _ ".";
+					copy-of bcersows:insertCSS();
+					copy-of bcersows:insertJS();
+					
+					<style> {
+						expr "pre p {}";
+					}
+				}
+				<body lang="en"> {
+					copy-of bcersows:insertHeaderBig( $myDevice );
+					copy-of bcersows:insertCompletionTest();
+					
+					if ( $connection ) { } else {	
+						<div class="error"> {
+							expr "Could not open connection."; <br>;
+							expr "Aborting.";
+						}
+					}	
+
+					copy-of bcersows:insertSoftwareInformation( $connection );
+					
+					var $interface = jcs:regex( "/device.*/interface-information/physical-interface\\[name=\"([^\"]*)\"\\].*", . )[2];
+					
+					<div> {
+						<p class="bold subheader">{
+							<span class="left"> { expr "Interface Information " _ $interface; }
+							copy-of bcersows:insertDownloadButton( "resultsTable", "InterfaceMigrationCheck_" _ $interface );
+						}
+						set $rpc = <get-configuration> {
+							<configuration> {
+								<protocols> {
+									<ancp> {
+										<neighbor>;
+									}
+								}
+							}
+						}
+						set $results = jcs:execute( $connection, $rpc );
+						call checkErrors( $resultsNodeSet = $results, $connection, $msg = "Error while getting ANCP configuration information." );
+						
+						var $ANANCPAddress = $results/protocols/ancp/neighbor[auto-configure-trigger/interface=$interface]/name/text();
+						
+						if ( $ANANCPAddress ) {
+							<p> 'ANCP Neighbor Address: ' _ $ANANCPAddress _ '.';
+						} else {
+							<div class="error"> 'No AN address could be read out of the config. Is this interface really configured correctly?';
+							<p> {
+								if ( count( $results/protocols/ancp/neighbor/name/text() ) > 0 ) {
+									<span> 'Available AN addresses (and their respective interfaces, if any):';
+									<ul> {
+										for-each ( $results/protocols/ancp/neighbor ) {
+											<li> {
+												expr ./name;
+												if ( ./auto-configure-trigger/interface ) { 
+													expr ' (' _ ./auto-configure-trigger/interface _ ')';
+												}
+											}
+										}
+									}
+								}
+							}
+						}
+						
+						if ( $ANANCPAddress ) {
+							set $rpc = <get-ancp-neighbor-information> {
+								<ip-address> $ANANCPAddress;
+							}
+							set $results = jcs:execute( $connection, $rpc );
+							call checkErrors( $resultsNodeSet = $results, $connection, $msg = "Error while getting ANCP information." );
+						}
+						var $ancpCount = $results//neighbor-subscriber-count ? $results//neighbor-subscriber-count : 0;
+						
+						set $rpc = <get-subscribers> {
+							<physical-interface> $interface;
+							<client-type> 'pppoe';
+							<count>;
+						}
+						set $results = jcs:execute( $connection, $rpc );
+						call checkErrors( $resultsNodeSet = $results, $connection, $msg = "Error while getting subscriber information." );
+						
+						var $subscriberCount = $results//number-of-active-subscribers _ ' (' _ $results//number-of-subscribers _ ')';
+						
+						set $rpc = <get-subscribers> {
+							<physical-interface> $interface;
+							<extensive>;
+						}
+						set $results = jcs:execute( $connection, $rpc );
+						call checkErrors( $resultsNodeSet = $results, $connection, $msg = "Error while getting IGMP information." );
+						
+						var $igmpCount = count( $results//service-session-name[text()="SRL"] );
+						
+						/* IF desc not needed anymore.. for now.. */
+						/*set $rpc = <get-interface-information> {
+							<interface-name> $interface;
+							<descriptions>;
+						}
+						set $results = jcs:execute( $connection, $rpc );
+						call checkErrors( $resultsNodeSet = $results, $connection, $msg = "Error while getting interface description information." );
+						
+						var $ifDesc = $results//physical-interface/description/text();*/
+						
+						<table id="resultsTable" class="table wide"> {
+							<tr> {
+								<th> "Interface";
+								<th> "ANCP sessions";
+								<th> "PPPoE Sessions active (total)";
+								<th> "IGMP Sessions";
+								/*<th> "Description";*/
+							}
+							<tr> {
+								<td> $interface;
+								<td> $ancpCount;
+								<td> $subscriberCount;
+								<td> $igmpCount;
+								/*<td> $ifDesc;*/
+							}
+						}
+						
+						copy-of bcersows:insertBackButton();
+					}
+					
+					var $duration = date:seconds() - date:seconds( $localtime );
+					<div class="wholeLine"> {
+						<span class="left italic unselectable"> "vs. 1.0";
+						expr "Execution time: " _ $duration _ "s. ";
+					}					
+				}
+			}
+		}
+		
+		expr jcs:close( $connection );
+	}
+}
+
+template checkErrors ( $resultsNodeSet, $msg = "", $connection ) {
+	if( $resultsNodeSet//self::xnm:error ) {
+		copy-of bcersows:outputErrorDiv($resultsNodeSet, $msg);
+	}
+}
+
+/*
+
+	show interfaces terse ge-0/0/2
+	show interfaces diagnostics optics ge-0/0/2.16
+	show arp interface ge-0/0/2.16
+	show route 10.12.10.1
+	show route forwarding-table destination 10.12.10.1
+	show system connections | match 10.12.10.1
+	ping 10.12.10.1 source 10.150.240.6 rapid count 5
+	show configuration interfaces ge-0/0/2
+
+*/

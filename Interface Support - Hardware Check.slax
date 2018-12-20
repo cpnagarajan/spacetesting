@@ -1,0 +1,264 @@
+/*
+	Pings remote host after V2PLS and admin/oper check of given interface.
+*/
+
+/*
+	Author: cheil, abartsch
+	Version: 1.2
+	Date: 26.01.2016
+	Last Modified By: abartsch	
+	###Interface Support - Hardware Check.slax;v1.2;2016.01.26
+*/
+
+/*
+	Changelog:
+	----------
+	1.0; 01.10.2014:
+		- Initial version.
+	1.1; 11.12.2015 - 22.12.2015 [abartsch]:
+		- Fixes and additions.
+	1.2; 26.01.2016 [abartsch]:
+		- Added support for LSR interfaces
+*/
+
+version 1.1;
+
+ns junos = "http://xml.juniper.net/junos/*/junos";
+ns xnm = "http://xml.juniper.net/xnm/1.1/xnm";
+ns jcs = "http://xml.juniper.net/junos/commit-scripts/1.0";
+/*ns slax = "http://xml.libslax.org/slax";*/
+ns exsl extension = "http://exslt.org/common";
+ns date = "http://exslt.org/dates-and-times";
+
+ns bcersows = "http://bcersows@telekom.de";
+import "Space_Library-Local.slax";
+
+import "../import/junos.xsl";
+
+/* @CONTEXT = "/device[matches(name, '\w{3}J\d{2,3}') or matches(name, '^(bng|BNG).*$')]/interface-information/physical-interface[starts-with(name, 'xe-') or starts-with(name, 'ge-')]" */
+/* @NAME = "Interface Support - Hardware Check" */
+/* @DESCRIPTION = "Pings remote host after V2PLS and admin/oper check of given interface." */
+/* @CATEGORY = "D02 Show" */
+/* @ISLOCAL = "true" */
+/* @EXECUTIONTYPE = "SINGLEEXECUTION" */
+/* @VARIABLECONTEXT = "[{'name':'interface','defaultvalue':''}]" */
+/* @PROMOTE="yes" */
+
+var $arguments = {
+	<argument> {
+		<name> "CONTEXT";
+		<description> "Context of script execution";
+	}
+}
+param $CONTEXT;
+
+match / {
+<op-script-results> {
+	mvar $results;
+	mvar $rpc;
+	
+	mvar $localtime = date:date-time();
+	
+	var $myDevice = {
+		expr jcs:regex( "/device\\[name=\"([^\"]*)\"\\].*", $CONTEXT )[2];
+	}
+	
+	var $connection = jcs:open();
+	
+	<output> {
+		<html> {
+			<head lang="en"> {
+				<title> "Informations for BNG " _ $myDevice _ ".";
+				copy-of bcersows:insertCSS();
+				copy-of bcersows:insertJS();
+				
+				<style> {
+					expr '.code { box-shadow: inset 1px 1px 1px 1px black; border: solid thin GREY; padding-left: 1px; padding-top: 1px; overflow-x: auto; }';
+					expr '.ping-table, .row .heading, .row .data { border: 1px solid black; border-collapse: collapse; }';
+					expr '.ping-table { width: 100%; }';
+					expr '.row .heading, .row .data { width: 15%; padding: 4px; text-align: left; }';
+					expr '.row .heading { background: black; color: white; }';
+				}
+			}
+			<body lang="en"> {
+				copy-of bcersows:insertHeaderBig( $myDevice );
+				copy-of bcersows:insertCompletionTest();
+
+				if ( $connection ) { } else {	
+					<div class="error"> {
+						expr "Could not open connection."; <br>;
+						expr "Aborting.";
+					}
+				}	
+
+				copy-of bcersows:insertSoftwareInformation( $connection );		
+
+				var $interface = jcs:regex( "/device.*/interface-information/physical-interface\\[name=\"([^\"]*)\"\\].*", . )[2];		
+
+				<div> {
+					<p class="bold"> {
+						expr "Hardware Check";
+					}
+					<p> { expr "Checking Interface " _ $interface _ "."; }
+
+					set $rpc = "get-configuration";
+					set $results = jcs:execute($connection, $rpc);
+					call checkErrors( $resultsNodeSet = $results, $connection, $msg = "Error." );
+					if ($results and not(jcs:empty($results))) {
+						var $config = $results;
+						var $intf = $results/interfaces/interface[name==$interface];
+						if (jcs:empty($intf)) {
+							<p class="majorError"> 'Please provide a valid interface name.';
+						}
+						else {
+							mvar $v2act;
+							set $v2act = false();
+							for-each($intf/unit) {					
+								if (./family/vpls) {
+									set $v2act = true();
+								}
+							}
+							if ($v2act) {
+								<p class="majorError"> 'L2VPLS is active on this interface.';
+							}
+							else {
+								set $rpc = "get-interface-information";
+								set $results = jcs:execute($connection, $rpc);
+								call checkErrors( $resultsNodeSet = $results, $connection, $msg = "Error." );
+								if ($results and not(jcs:empty($results))) {
+									var $admin = $results/physical-interface[name==$interface]/admin-status;
+									var $oper = $results/physical-interface[name==$interface]/oper-status;
+
+									if (not(($admin=='up') && ($oper=='up'))) {
+										<p class="majorError"> 'Interface status is not UP/UP.';
+									}
+									else {
+										<p> {
+												expr "L2VPLS not active and interface status is UP/UP.";
+										}
+										mvar $addressCount = 0;
+
+										if ($config/interfaces/interface[name==$interface]/unit[name=="0"]/family/mpls) {
+											var $address = $config/interfaces/interface[name==$interface]/unit[name=="0"]/family/inet/address/name;
+											if ($address and not(jcs:empty($address))) {
+												set $addressCount = $addressCount + 1;
+												call ping-and-output($address, $desc = "(unit 0, LSR interface)", $connection);
+											}
+										}
+
+										var $ANunits := {
+											<n> 16;
+											<n> 17;
+											<n> 18;
+											<n> 19;
+										}
+										for-each($ANunits/n) {
+											var $unitnr = .;
+											var $address =	$config/interfaces/interface[name==$interface]/unit[name==$unitnr]/family/inet/address/name;
+											if ($address and not(jcs:empty($address))) {
+												set $addressCount = $addressCount + 1;
+												call ping-and-output($address, $desc = "(unit " _ $unitnr _ ", AN interface)", $connection);
+											}
+										}
+
+										if ($addressCount == 0) {
+											<p class="majorError"> 'No IP address found!';
+										}
+										else {
+										}
+									}
+								}
+								else {
+									<p class="majorError"> 'get-interface-information command not working.';
+								}
+							}
+						}
+					}
+					else {
+						<p class="majorError"> 'get-configuration command not working.';
+					}
+				}
+				var $duration = date:seconds() - date:seconds( $localtime );
+				<div class="wholeLine"> {
+					<span class="left italic unselectable"> "vs. 1.2";
+					expr "Execution time: " _ $duration _ "s. ";
+				}
+			}
+		}
+	}
+	expr jcs:close( $connection );
+}
+}
+
+
+template ping-and-output ( $address, $desc, $connection ) {
+	mvar $results;
+	mvar $rpc;
+
+	var $src = slax:split("/", $address)[1];
+	var $dst-parts = slax:split("\\.", $src);
+	var $dst-part4 = $dst-parts[4] - 1;
+	var $dst = $dst-parts[1] _ "." _ $dst-parts[2] _ "." _ $dst-parts[3] _ "." _ $dst-part4;
+	set $rpc = <command> 'ping "' _ $dst _ '" source "' _ $src _ '" count 50 detail rapid';
+	<p> {
+		expr "Pinging " _ $dst _ " " _ $desc _ " ...";
+	}
+	set $results = jcs:execute($connection, $rpc);
+	call checkErrors( $resultsNodeSet = $results, $connection, $msg = "Error." );
+
+	if ($results and not( jcs:empty($results) )) {
+		<pre class="code"> {
+			if ($results/ping-success) {
+				/*copy-of $results;*/
+				<div class="bold"> { expr "Summary\n"; }
+				expr "Target IP: " _ $results/target-ip _ "\n";
+				expr "Packet size: "  _ $results/packet-size _ " bytes	-  Packets transmitted: " _ $results/probe-results-summary/probes-sent _ "	-  Packets received: " _ $results/probe-results-summary/responses-received _ "	-  Packet loss: " _$results/probe-results-summary/packet-loss _" %\n";
+				expr "Round-trip min/avg/max/std-dev: " _ $results/probe-results-summary/rtt-minimum _ "/" _ $results/probe-results-summary/rtt-average _ "/"  _ $results/probe-results-summary/rtt-maximum _ "/"  _ $results/probe-results-summary/rtt-stddev _ " ms";
+				<table class="ping-table"> {
+					<caption> { expr "ping list"; }
+					<tr class="row"> {
+						<th class="heading"> { expr "Probe index"; }
+						<th class="heading"> { expr "Sequence number"; }
+						<th class="heading"> { expr "IP-Address"; }
+						<th class="heading"> { expr "Time-to-live";}
+						<th class="heading"> { expr "Response size (bytes)"; }
+						<th class="heading"> { expr "Round trip time (ms)"; }
+					}
+					for-each($results/probe-result) {
+						<tr class="row"> {
+							<td class="data"> { expr ./probe-index; }
+							<td class="data"> { expr ./sequence-number; }
+							<td class="data"> { expr ./ip-address; }
+							<td class="data"> { expr ./time-to-live; }
+							<td class="data"> { expr ./response-size; }
+							<td class="data"> { expr ./rtt; }
+						}
+					}
+				}
+			}
+			else if ($results/ping-failure) {
+				<p class="bold"> {
+					expr "Ping failed: " _ $results/ping-failure;
+					if ($results/xnm:warning) {
+						<br>;
+						expr "last warning message: " _ $results/xnm:warning/message;
+					}
+				}
+			}
+			else {
+				<p class="bold"> { expr "Ping failed."; }
+			}
+		}
+	}
+	else {
+		<p class="majorError"> 'Ping command failed.';
+	}
+}
+
+
+
+template checkErrors ( $resultsNodeSet, $msg = "", $connection ) {
+	if ( $resultsNodeSet//self::xnm:error ) {
+		copy-of bcersows:outputErrorDiv($resultsNodeSet, $msg);
+	}
+}

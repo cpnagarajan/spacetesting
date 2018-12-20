@@ -1,0 +1,180 @@
+/* 
+	Deletes the interface statistics of the selected interfaces.			
+*/
+
+/*
+	Author: bcersows
+	Version: 1.0
+	Date: 25.03.2015
+	Last Modified By: bcersows
+	###Interface - Clear Statistics.slax;v1.00;2015.03.25
+*/
+
+/*
+	Changelog:
+	----------
+	1.0; 25.03.2015: 
+		- First version.
+*/
+
+version 1.1;
+
+ns junos = "http://xml.juniper.net/junos/*/junos";
+ns xnm = "http://xml.juniper.net/xnm/1.1/xnm";
+ns jcs = "http://xml.juniper.net/junos/commit-scripts/1.0";
+/*ns slax = "http://xml.libslax.org/slax";*/
+ns date = "http://exslt.org/dates-and-times";
+ns os extension = "http://xml.libslax.org/os";
+
+ns bcersows = "http://bcersows@telekom.de";
+import "Space_Library-Local.slax";
+
+import "../import/junos.xsl";
+
+/* @CONTEXT = "/device[matches(name, '\w{3}J\d{2,3}') or matches(name, '^(bng|BNG).*$')]/interface-information/physical-interface[starts-with(name, 'xe-') or starts-with(name, 'ge-')]" */
+/* @NAME = "Interface - Clear Statistics" */
+/* @DESCRIPTION = "Deletes the interface statistics of the selected interfaces." */
+/* @CATEGORY = "D05 Router" */
+/* @ISLOCAL = "true" */
+/* @EXECUTIONTYPE = "GROUPEDEXECUTION" */
+/* @VARIABLECONTEXT = "[{'name':'DEVICE','defaultvaluexpath':'/device/name/text()'}]" */
+/* @PROMOTE="yes" */
+/* @PASSDEVICECREDENTIALS = "true" */
+
+mvar $counter = 0;
+
+var $arguments = {
+	<argument> {
+		<name> "CONTEXT";
+		<description> "Context of script execution";
+	}
+}
+param $CONTEXT;
+param $INTERFACE;
+
+match / {
+<op-script-results> {
+/*template junoscript() {*/
+	mvar $results;
+	mvar $configRpcs;
+	mvar $unlock-results;
+	
+	mvar $localtime = date:date-time();
+	
+	/* Split interfaces and Credentials */
+	var $interfaces = jcs:split("\\|", $CONTEXT);
+	var $splitCredentials = str:split( $credentials , "\\;" );
+	
+	/* Push the devices and according credentials into one node-set. */
+	mvar $currDev = "";
+	mvar $credentialPosition = 0;
+	var $deviceCredentials := {
+		for-each ( $interfaces ) {
+			<device> {
+				var $tempDevName = jcs:regex( "/device\\[name=\"([^\"]*)\"\\].*", . )[2];
+				<name> $tempDevName;
+				<context> .;
+				<interface> {
+					expr jcs:regex( "/device.*/interface-information/physical-interface\\[name=\"([^\"]*)\"\\].*", . )[2];
+				}
+				if ( $tempDevName != $currDev ) {
+					set $credentialPosition = $credentialPosition + 1;
+				}
+				<credentials> $splitCredentials[ $credentialPosition ];
+				
+				set $currDev = $tempDevName;
+			}
+		}
+	}
+	
+	var $myDevice = {
+		for-each ( $deviceCredentials/device/name ) {
+			<xsl:sort>;
+			expr .;
+			if ( position() != last() ) {
+				expr ", ";
+			}
+		}
+	}
+	
+	<output> {
+		<html> {
+			<head lang="en"> {
+				<title> "Informations for BNG " _ $myDevice _ ".";
+				copy-of bcersows:insertCSS();
+				copy-of bcersows:insertJS();
+			}
+			<body lang="en"> {
+				copy-of bcersows:insertHeaderBig( $myDevice );
+				
+				copy-of bcersows:insertCompletionTest();
+				
+				<div> {
+					<p class="bold subheader">{
+						<span class="left"> { expr "Output"; }
+					}
+					<table> {
+						<tr> {
+							<th> "Device";
+							<th> "Interface";
+							<th> "Result";
+						}
+						for-each ( $deviceCredentials/device ) {
+							<xsl:sort>;
+							
+							/* Using the count of unique devices found, the correct connection */
+							/* parameters to be used can be derived from $splitCredentials     */
+							var $splitCredential = str:split( ./credentials, "\\:" );
+							
+							var $hostname = $splitCredential[1];
+							var $password = $splitCredential[2];
+							var $splitHostname = str:split( $hostname[1] , "\@");
+							var $user = $splitHostname[1];
+							var $ip = $splitHostname[2];
+							var $dev = ./name;
+							
+							var $connection = jcs:open( $ip , $user , $password );
+							
+							var $iname = ./interface;
+							<tr> {
+								<td> $dev;
+								<td> $iname;
+								
+								var $rpc = <clear-interfaces-statistics> {
+									<interface-name> $iname;
+								};
+								
+								if ( $connection && !$connection//self::xnm:error ) {
+									set $results = jcs:execute( $connection, $rpc );
+									if ( $results//self::xnm:error ) {
+										<td class="majorError"> "Error while issuing command: " _ $results//self::xnm:error/message;
+									} else {
+										<td class="infoError"> "Successfully issued command.";
+									}
+								} else {
+									<td class="majorError"> "Could not open connection.";
+								}
+							}
+							expr jcs:close( $connection );
+						}
+					}
+					copy-of bcersows:insertBackButton();
+				}
+				
+				var $duration = date:seconds() - date:seconds( $localtime );
+				<div class="wholeLine"> {
+					<span class="left italic unselectable"> "vs. 1.0";
+					expr "Execution time: " _ $duration _ "s. ";
+				}
+			}
+		}
+	}
+	
+}
+}
+
+template checkErrors ( $resultsNodeSet, $msg = "", $connection ) {
+	if( $resultsNodeSet//self::xnm:error ) {
+		copy-of bcersows:outputErrorDiv($resultsNodeSet, $msg);
+	}
+}
